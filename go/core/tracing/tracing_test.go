@@ -545,6 +545,82 @@ func TestIsFailureSourceOnError(t *testing.T) {
 	}
 }
 
+// TestIsFailureSourceOnlyOnOriginatingSpan verifies that a failure is attributed
+// to the span where the error originates rather than to every span that
+// propagates it, while all of them still report the error state.
+func TestIsFailureSourceOnlyOnOriginatingSpan(t *testing.T) {
+	ctx := context.Background()
+	boom := errors.New("boom")
+
+	var outerSM, middleSM, innerSM *spanMetadata
+
+	_, err := RunInNewSpan(ctx, &SpanMetadata{Name: "outer", Type: "action", Subtype: "flow"}, "in",
+		func(ctx context.Context, in string) (string, error) {
+			outerSM = spanMetaKey.FromContext(ctx)
+			return RunInNewSpan(ctx, &SpanMetadata{Name: "middle", Type: "action"}, in,
+				func(ctx context.Context, in string) (string, error) {
+					middleSM = spanMetaKey.FromContext(ctx)
+					return RunInNewSpan(ctx, &SpanMetadata{Name: "inner", Type: "action", Subtype: "tool"}, in,
+						func(ctx context.Context, in string) (string, error) {
+							innerSM = spanMetaKey.FromContext(ctx)
+							return "", boom
+						})
+				})
+		})
+
+	if err != boom {
+		t.Errorf("outermost span returned %#v, want the caller's original error %#v", err, boom)
+	}
+
+	if !innerSM.IsFailureSource {
+		t.Error("originating span is not marked as the failure source")
+	}
+	for _, sm := range []*spanMetadata{middleSM, outerSM} {
+		if sm.IsFailureSource {
+			t.Errorf("span %q only propagated the failure but is marked as its source", sm.Name)
+		}
+		if sm.State != spanStateError {
+			t.Errorf("span %q state = %q, want %q", sm.Name, sm.State, spanStateError)
+		}
+		if sm.Error != boom.Error() {
+			t.Errorf("span %q error = %q, want %q", sm.Name, sm.Error, boom.Error())
+		}
+	}
+}
+
+// TestFailureSourceMarkerStaysBelowApplicationWrapping verifies that the marker
+// does not disturb an error the application wrapped on its way up: the message
+// and the chain both survive, and the wrapping is not discarded.
+func TestFailureSourceMarkerStaysBelowApplicationWrapping(t *testing.T) {
+	ctx := context.Background()
+	boom := errors.New("boom")
+
+	var innerSM *spanMetadata
+
+	_, err := RunInNewSpan(ctx, &SpanMetadata{Name: "outer", Type: "action", Subtype: "flow"}, "in",
+		func(ctx context.Context, in string) (string, error) {
+			wrapped, innerErr := RunInNewSpan(ctx, &SpanMetadata{Name: "inner", Type: "action"}, in,
+				func(ctx context.Context, in string) (string, error) {
+					innerSM = spanMetaKey.FromContext(ctx)
+					return "", boom
+				})
+			if innerErr != nil {
+				return "", fmt.Errorf("inner call failed: %w", innerErr)
+			}
+			return wrapped, nil
+		})
+
+	if got, want := err.Error(), "inner call failed: boom"; got != want {
+		t.Errorf("error message = %q, want %q", got, want)
+	}
+	if !errors.Is(err, boom) {
+		t.Errorf("errors.Is(%v, boom) = false, want the original error to stay reachable", err)
+	}
+	if !innerSM.IsFailureSource {
+		t.Error("originating span is not marked as the failure source")
+	}
+}
+
 func TestRunInNewSpanRecordsPartialOutputOnError(t *testing.T) {
 	// A failure can still carry a result, so the span records it and a trace
 	// shows what the call produced. A failure that produced nothing records
