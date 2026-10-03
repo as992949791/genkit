@@ -55,7 +55,7 @@ func markErrorAsHandled(err error) error {
 	var me *markedError
 	if errors.As(err, &me) {
 		me.marked = true
-		return me
+		return err
 	}
 
 	return &markedError{error: err, marked: true}
@@ -340,6 +340,7 @@ func RunInNewSpan[I, O any](
 	if err != nil {
 		sm.State = spanStateError
 		sm.Error = err.Error()
+		span.SetStatus(codes.Error, err.Error())
 		// Only the span where an error originates is its failure source. The
 		// marker travels up with the error so ancestors can tell originating a
 		// failure from propagating one; without it every span in the call stack
@@ -349,7 +350,6 @@ func RunInNewSpan[I, O any](
 		if !isErrorAlreadyMarked(err) {
 			sm.IsFailureSource = true
 			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
 			err = markErrorAsHandled(err)
 		}
 		// A failure can still carry a result: the generate loop returns the

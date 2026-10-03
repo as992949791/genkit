@@ -25,6 +25,8 @@ import (
 	"testing"
 
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
 // TODO: add tests that compare tracing data saved to disk with goldens.
@@ -551,6 +553,10 @@ func TestIsFailureSourceOnError(t *testing.T) {
 func TestIsFailureSourceOnlyOnOriginatingSpan(t *testing.T) {
 	ctx := context.Background()
 	boom := errors.New("boom")
+	recorder := tracetest.NewSpanRecorder()
+	tp := TracerProvider()
+	tp.RegisterSpanProcessor(recorder)
+	t.Cleanup(func() { tp.UnregisterSpanProcessor(recorder) })
 
 	var outerSM, middleSM, innerSM *spanMetadata
 
@@ -585,6 +591,58 @@ func TestIsFailureSourceOnlyOnOriginatingSpan(t *testing.T) {
 		if sm.Error != boom.Error() {
 			t.Errorf("span %q error = %q, want %q", sm.Name, sm.Error, boom.Error())
 		}
+	}
+	spans := recorder.Ended()
+	if len(spans) != 3 {
+		t.Fatalf("recorded %d spans, want 3", len(spans))
+	}
+	for _, span := range spans {
+		if status := span.Status(); status.Code != codes.Error || status.Description != boom.Error() {
+			t.Errorf("span %q status = %v, want Error with description %q", span.Name(), status, boom.Error())
+		}
+		wantEvents := 0
+		if span.Name() == "inner" {
+			wantEvents = 1
+		}
+		if events := span.Events(); len(events) != wantEvents {
+			t.Errorf("span %q recorded %d events, want %d", span.Name(), len(events), wantEvents)
+		}
+	}
+}
+
+func TestMarkErrorAsHandledPreservesApplicationWrapping(t *testing.T) {
+	for _, marked := range []bool{false, true} {
+		t.Run(fmt.Sprintf("marked=%t", marked), func(t *testing.T) {
+			boom := errors.New("boom")
+			marker := &markedError{error: boom, marked: marked}
+			wrapped := fmt.Errorf("inner call failed: %w", marker)
+			got := markErrorAsHandled(wrapped)
+			if got != wrapped {
+				t.Errorf("returned error %v, want the original application wrapper %v", got, wrapped)
+			}
+			if !marker.marked || !isErrorAlreadyMarked(got) {
+				t.Error("error was not marked as handled")
+			}
+			if !errors.Is(got, boom) {
+				t.Error("original error is no longer reachable")
+			}
+		})
+	}
+}
+
+func TestRunInNewSpanPreservesWrappedUnmarkedError(t *testing.T) {
+	boom := errors.New("boom")
+	marker := &markedError{error: boom}
+	wrapped := fmt.Errorf("inner call failed: %w", marker)
+	_, err := RunInNewSpan(context.Background(), &SpanMetadata{Name: "outer"}, "in",
+		func(context.Context, string) (string, error) {
+			return "", wrapped
+		})
+	if err != wrapped {
+		t.Errorf("returned error %v, want the original application wrapper %v", err, wrapped)
+	}
+	if !marker.marked {
+		t.Error("error was not marked as handled")
 	}
 }
 
